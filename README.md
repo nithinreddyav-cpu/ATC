@@ -3,8 +3,7 @@ import cv2
 import numpy as np
 import time
 import RPi.GPIO as GPIO
-from picamera import PiCamera
-from picamera.array import PiRGBArray
+from picamera2 import Picamera2
 
 # ------------------------------------------------------------
 # GPIO SETUP
@@ -12,7 +11,7 @@ from picamera.array import PiRGBArray
 GPIO.setmode(GPIO.BCM)
 GPIO.setwarnings(False)
 
-# L298N Motor Driver Pins
+# L298N Motor pins
 LEFT_EN = 12
 LEFT_IN1 = 5
 LEFT_IN2 = 6
@@ -41,7 +40,7 @@ for trig, echo in SENSORS.values():
     GPIO.setup(trig, GPIO.OUT)
     GPIO.setup(echo, GPIO.IN)
 
-# Servos for collector
+# Servos
 SERVO_DOOR = 18
 SERVO_ARM = 19
 GPIO.setup(SERVO_DOOR, GPIO.OUT)
@@ -53,7 +52,7 @@ servo_door.start(0)
 servo_arm.start(0)
 
 # ------------------------------------------------------------
-# MOTOR CONTROL
+# MOTOR CONTROL FUNCTIONS
 # ------------------------------------------------------------
 def set_motor(left, right):
     if left >= 0:
@@ -80,26 +79,29 @@ def turn_right(s=45): set_motor(s, -s)
 def stop(): set_motor(0, 0)
 
 # ------------------------------------------------------------
-# ULTRASONIC
+# ULTRASONIC SENSOR FUNCTION
 # ------------------------------------------------------------
 def measure_distance(trig, echo):
     GPIO.output(trig, False)
     time.sleep(0.0002)
+
     GPIO.output(trig, True)
     time.sleep(0.00001)
     GPIO.output(trig, False)
 
-    start, end = 0, 0
-    timeout = time.time() + 0.04
+    start = time.time()
+    stop = time.time()
+
+    timeout = time.time() + 0.04  # 40ms
 
     while GPIO.input(echo) == 0 and time.time() < timeout:
         start = time.time()
 
     while GPIO.input(echo) == 1 and time.time() < timeout:
-        end = time.time()
+        stop = time.time()
 
-    duration = end - start
-    return duration * 17150  # cm
+    elapsed = stop - start
+    return elapsed * 17150  # Convert to cm
 
 def read_all_sensors():
     dist = {}
@@ -125,36 +127,32 @@ def close_collector():
     set_servo(servo_door, 0)
 
 # ------------------------------------------------------------
-# CAMERA SETUP
+# CAMERA SETUP USING PICAMERA2
 # ------------------------------------------------------------
-camera = PiCamera()
-camera.resolution = (320, 240)
-camera.framerate = 16
-raw = PiRGBArray(camera, size=(320, 240))
+picam = Picamera2()
+config = picam.create_video_configuration(main={"size": (320, 240)})
+picam.configure(config)
+picam.start()
 time.sleep(1)
 
-bg = cv2.createBackgroundSubtractorMOG2(history=300, varThreshold=50)
+bg = cv2.createBackgroundSubtractorMOG2(history=300, varThreshold=40)
 MIN_AREA = 800
 
 # ------------------------------------------------------------
 # MAIN LOOP
 # ------------------------------------------------------------
 def main():
-    print("🚀 Autonomous Trash Collector Started...")
+    print("🚀 Autonomous Trash Collector (Picamera2) Started...")
 
-    for frame in camera.capture_continuous(raw, format="bgr", use_video_port=True):
-        img = frame.array
+    while True:
+        img = picam.capture_array()
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-        # Background subtraction
         fg = bg.apply(gray)
         fg = cv2.medianBlur(fg, 5)
 
         contours, _ = cv2.findContours(fg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        # ------------------------------------------------------------
-        # MULTI-OBJECT DETECTION → SELECT NEAREST
-        # ------------------------------------------------------------
         detected = []
 
         for c in contours:
@@ -175,18 +173,15 @@ def main():
         if len(detected) == 0:
             print("Searching for trash...")
             turn_left(40)
-            time.sleep(0.3)
+            time.sleep(0.25)
             stop()
-            raw.truncate(0)
             continue
 
-        # Select nearest (largest area)
+        # Nearest trash = biggest area
         target = max(detected, key=lambda x: x["area"])
         cx = target["cx"]
 
-        # ------------------------------------------------------------
-        # COLOR-BASED TRASH IDENTIFICATION
-        # ------------------------------------------------------------
+        # --------------- COLOR CLASSIFICATION ----------------
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
 
         plastic_mask = cv2.inRange(hsv, (0, 0, 200), (180, 50, 255))
@@ -206,37 +201,31 @@ def main():
             trash_type = "organic"
 
         if trash_type == "organic":
-            print("Organic detected → ignoring...")
-            raw.truncate(0)
+            print("Organic → ignored")
             continue
 
-        print("Nearest trash detected:", trash_type)
+        print("Nearest trash:", trash_type)
 
-        # ------------------------------------------------------------
-        # ALIGN TO TRASH
-        # ------------------------------------------------------------
-        center = img.shape[1] // 2
-        offset = cx - center
+        # ---------------- ALIGN AND MOVE ----------------
+        frame_center = 320 // 2
+        offset = cx - frame_center
 
         if abs(offset) < 40:
             print("Aligned → moving forward")
-            forward(55)
+            forward(60)
         else:
             if offset < 0:
-                print("Turning left...")
+                print("Turning left")
                 turn_left(45)
             else:
-                print("Turning right...")
+                print("Turning right")
                 turn_right(45)
 
-        # ------------------------------------------------------------
-        # OBSTACLE CHECK + COLLECTION
-        # ------------------------------------------------------------
-        dist = read_all_sensors()
-        front = dist["front"]
+        distances = read_all_sensors()
+        front = distances["front"]
 
-        if front < 28:
-            print("Close to trash → collecting")
+        if front < 30:
+            print("Close to trash → Collecting")
             stop()
             open_collector()
             time.sleep(1.5)
@@ -245,9 +234,7 @@ def main():
             time.sleep(1)
             stop()
 
-        raw.truncate(0)
         time.sleep(0.05)
-
 
 try:
     main()
@@ -260,3 +247,4 @@ finally:
     servo_door.stop()
     servo_arm.stop()
     GPIO.cleanup()
+    picam.stop()
