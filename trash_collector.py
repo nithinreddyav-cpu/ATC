@@ -12,7 +12,7 @@ GPIO.setwarnings(False)
 # MOTOR DRIVER (L298N)
 # =====================================================================
 LEFT_EN=12; LEFT_IN1=5; LEFT_IN2=6
-RIGHT_EN=13; RIGHT_IN3=16; RIGHT_IN4=20
+RIGHT_EN=13; RIGHT_IN3=14; RIGHT_IN4=20
 
 motor_pins = [LEFT_EN, LEFT_IN1, LEFT_IN2, RIGHT_EN, RIGHT_IN3, RIGHT_IN4]
 for p in motor_pins:
