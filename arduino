@@ -3,26 +3,27 @@
 #include <ArduinoJson.h>
 #include <Servo.h>
 
+// ---------------- WIFI CONFIG -----------------
 const char* SSID = "YOUR_SSID";
 const char* PASS = "YOUR_PASSWORD";
 
 WiFiUDP udp;
 const int UDP_PORT = 8888;
 
-unsigned long nowMs = 0;
-
-// ---------------- MOTOR PINS ---------------------
+// ---------------- MOTOR PINS ------------------
 #define IN1 16
 #define IN2 17
 #define IN3 18
 #define IN4 19
+
 #define PWM_A 21
 #define PWM_B 22
 
-int SPEED_FORWARD = 180;
+int SPEED_FWD = 180;
 int SPEED_TURN = 150;
+int SPEED_BACK = 160;
 
-// ---------------- ULTRASONICS --------------------
+// ---------------- ULTRASONICS -----------------
 #define TF_TRIG 32
 #define TF_ECHO 33
 
@@ -35,34 +36,39 @@ int SPEED_TURN = 150;
 #define TS_TRIG 12
 #define TS_ECHO 13
 
-float long_limit = 200;
-float short_limit = 10;
+float LONG_LIMIT = 200;     // 200 cm obstacle avoidance
+float SHORT_LIMIT = 10;     // 10 cm for pickup
 
-// ---------------- SERVO --------------------------
-Servo servo;
-int servoPos = 90;
+// ---------------- SERVO ------------------------
+Servo myservo;
 bool servoActive = false;
 unsigned long servoStart = 0;
 
-// ---------------- TIMERS -------------------------
+// ---------------- TIMERS ----------------------
+unsigned long nowMs = 0;
 unsigned long lastObstacleCheck = 0;
 unsigned long lastMotorAction = 0;
 unsigned long motorActionTime = 0;
 
-// --------------- STATES --------------------------
+// ---------------- STATES ----------------------
 String motorState = "stop";
 String navDirection = "center";
 
+// ----------- ULTRASONIC MEASURE --------------
 long readCM(int trig, int echo) {
-  digitalWrite(trig, LOW); delayMicroseconds(2);
-  digitalWrite(trig, HIGH); delayMicroseconds(10);
+  digitalWrite(trig, LOW); 
+  delayMicroseconds(2);
+  digitalWrite(trig, HIGH); 
+  delayMicroseconds(10);
   digitalWrite(trig, LOW);
 
   long dur = pulseIn(echo, HIGH, 25000);
   if (dur <= 0) return 999;
+
   return dur / 29 / 2;
 }
 
+// ----------- MOTOR FUNCTIONS -------------------
 void motorStop() {
   digitalWrite(IN1, LOW); digitalWrite(IN2, LOW);
   digitalWrite(IN3, LOW); digitalWrite(IN4, LOW);
@@ -73,12 +79,19 @@ void motorStop() {
 void motorForward() {
   digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
   digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
-  ledcWrite(0, SPEED_FORWARD);
-  ledcWrite(1, SPEED_FORWARD);
+  ledcWrite(0, SPEED_FWD);
+  ledcWrite(1, SPEED_FWD);
+}
+
+void motorBackward() {
+  digitalWrite(IN1, LOW);  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH);
+  ledcWrite(0, SPEED_BACK);
+  ledcWrite(1, SPEED_BACK);
 }
 
 void turnLeft() {
-  digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH);
+  digitalWrite(IN1, LOW);  digitalWrite(IN2, HIGH);
   digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
   ledcWrite(0, SPEED_TURN);
   ledcWrite(1, SPEED_TURN);
@@ -86,106 +99,116 @@ void turnLeft() {
 
 void turnRight() {
   digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
-  digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH);
+  digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH);
   ledcWrite(0, SPEED_TURN);
   ledcWrite(1, SPEED_TURN);
 }
 
+// ---------- SERVO NON-BLOCKING UPDATE ---------
 void smoothServoUpdate() {
   if (!servoActive) return;
 
-  if (millis() - servoStart < 600) {
-    servo.write(180);
-  } else if (millis() - servoStart < 1100) {
-    // hold
-  } else if (millis() - servoStart < 1700) {
-    servo.write(90);
+  unsigned long elapsed = millis() - servoStart;
+
+  if (elapsed < 600) {
+    myservo.write(180);       // Swing down
+  } else if (elapsed < 1100) {
+    myservo.write(180);       // Hold
+  } else if (elapsed < 1700) {
+    myservo.write(90);        // Return
   } else {
     servoActive = false;
-    servo.write(90);
+    myservo.write(90);
   }
 }
 
+// ---------- SHORT RANGE PICKUP ----------------
 void attemptPickup() {
   long d = readCM(TS_TRIG, TS_ECHO);
-  if (d < short_limit) {
+  if (d <= SHORT_LIMIT) {
     servoActive = true;
     servoStart = millis();
   }
 }
 
+// ---------- OBSTACLE AVOIDANCE ----------------
 void obstacleAvoidance() {
   long dF = readCM(TF_TRIG, TF_ECHO);
   long dL = readCM(TL_TRIG, TL_ECHO);
   long dR = readCM(TR_TRIG, TR_ECHO);
 
-  if (dF < long_limit) {
-    motorStop();
-    motorActionTime = 400;
+  if (dF < LONG_LIMIT) {
     motorState = "back";
+    motorActionTime = 450;
     lastMotorAction = millis();
     return;
   }
-  if (dL < long_limit) {
-    motorStop();
-    motorActionTime = 300;
+  if (dL < LONG_LIMIT) {
     motorState = "right";
+    motorActionTime = 300;
     lastMotorAction = millis();
     return;
   }
-  if (dR < long_limit) {
-    motorStop();
-    motorActionTime = 300;
+  if (dR < LONG_LIMIT) {
     motorState = "left";
+    motorActionTime = 300;
     lastMotorAction = millis();
     return;
   }
 }
 
+// ---------- MOTOR STATE MACHINE ---------------
 void updateMotor() {
   if (millis() - lastMotorAction < motorActionTime) {
     if (motorState == "forward") motorForward();
     else if (motorState == "left") turnLeft();
     else if (motorState == "right") turnRight();
-    else if (motorState == "back") ; // already stopped
+    else if (motorState == "back") motorBackward();
     return;
   }
 
-  if (motorState != "stop") {
-    motorStop();
-    motorState = "stop";
-  }
+  motorStop();
+  motorState = "stop";
 }
 
+// -------------- UDP COMMANDS -------------------
 void processCommand(String jsonStr) {
   StaticJsonDocument<200> doc;
-  deserializeJson(doc, jsonStr);
+  DeserializationError err = deserializeJson(doc, jsonStr);
+  if (err) return;
 
   String cmd = doc["cmd"];
 
   if (cmd == "navigate") {
     navDirection = doc["pos"].as<String>();
+
     if (navDirection == "left") motorState = "left";
     else if (navDirection == "right") motorState = "right";
     else motorState = "forward";
 
-    motorActionTime = 500;
+    motorActionTime = 600;
     lastMotorAction = millis();
   }
 
   else if (cmd == "stop_and_pick") {
     motorState = "stop";
-    motorStop();
     attemptPickup();
   }
 
   else if (cmd == "scan") {
     motorState = "forward";
-    motorActionTime = 400;
+    motorActionTime = 500;
+    lastMotorAction = millis();
+  }
+
+  else if (cmd == "back") {
+    motorState = "back";
+    motorActionTime = 600;
     lastMotorAction = millis();
   }
 }
 
+// -------------- SETUP --------------------------
 void setup() {
   Serial.begin(115200);
 
@@ -202,18 +225,23 @@ void setup() {
   pinMode(TR_TRIG, OUTPUT); pinMode(TR_ECHO, INPUT);
   pinMode(TS_TRIG, OUTPUT); pinMode(TS_ECHO, INPUT);
 
-  servo.attach(23);
-  servo.write(90);
+  myservo.attach(23);
+  myservo.write(90);
 
   WiFi.begin(SSID, PASS);
   while (WiFi.status() != WL_CONNECTED) delay(200);
 
   udp.begin(UDP_PORT);
+
+  Serial.print("ESP32 Ready. IP: ");
+  Serial.println(WiFi.localIP());
 }
 
+// ---------------- MAIN LOOP --------------------
 void loop() {
   nowMs = millis();
 
+  // 1. UDP commands
   int pkt = udp.parsePacket();
   if (pkt) {
     char data[256];
@@ -222,12 +250,15 @@ void loop() {
     processCommand(String(data));
   }
 
+  // 2. Check obstacles every 70ms
   if (nowMs - lastObstacleCheck > 70) {
     obstacleAvoidance();
     lastObstacleCheck = nowMs;
   }
 
+  // 3. Servo smooth action
   smoothServoUpdate();
 
+  // 4. Smooth motor control
   updateMotor();
 }
