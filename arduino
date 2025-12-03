@@ -1,11 +1,11 @@
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <ArduinoJson.h>
-#include <Servo.h>
+#include <ESP32Servo.h>
 
 // ---------------- WIFI CONFIG -----------------
-const char* SSID = "YOUR_SSID";
-const char* PASS = "YOUR_PASSWORD";
+const char* SSID = "Sailaja PG 201";
+const char* PASS = "sailajapg201";
 
 WiFiUDP udp;
 const int UDP_PORT = 8888;
@@ -37,7 +37,7 @@ int SPEED_BACK = 160;
 #define TS_ECHO 13
 
 float LONG_LIMIT = 200;     // 200 cm obstacle avoidance
-float SHORT_LIMIT = 10;     // 10 cm for pickup
+float SHORT_LIMIT = 10;     // 10 cm servo pickup
 
 // ---------------- SERVO ------------------------
 Servo myservo;
@@ -56,9 +56,9 @@ String navDirection = "center";
 
 // ----------- ULTRASONIC MEASURE --------------
 long readCM(int trig, int echo) {
-  digitalWrite(trig, LOW); 
+  digitalWrite(trig, LOW);
   delayMicroseconds(2);
-  digitalWrite(trig, HIGH); 
+  digitalWrite(trig, HIGH);
   delayMicroseconds(10);
   digitalWrite(trig, LOW);
 
@@ -84,14 +84,14 @@ void motorForward() {
 }
 
 void motorBackward() {
-  digitalWrite(IN1, LOW);  digitalWrite(IN2, HIGH);
-  digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH);
+  digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH);
   ledcWrite(0, SPEED_BACK);
   ledcWrite(1, SPEED_BACK);
 }
 
 void turnLeft() {
-  digitalWrite(IN1, LOW);  digitalWrite(IN2, HIGH);
+  digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH);
   digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
   ledcWrite(0, SPEED_TURN);
   ledcWrite(1, SPEED_TURN);
@@ -99,7 +99,7 @@ void turnLeft() {
 
 void turnRight() {
   digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
-  digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH);
   ledcWrite(0, SPEED_TURN);
   ledcWrite(1, SPEED_TURN);
 }
@@ -111,11 +111,11 @@ void smoothServoUpdate() {
   unsigned long elapsed = millis() - servoStart;
 
   if (elapsed < 600) {
-    myservo.write(180);       // Swing down
+    myservo.write(180);
   } else if (elapsed < 1100) {
-    myservo.write(180);       // Hold
+    myservo.write(180);
   } else if (elapsed < 1700) {
-    myservo.write(90);        // Return
+    myservo.write(90);
   } else {
     servoActive = false;
     myservo.write(90);
@@ -225,9 +225,17 @@ void setup() {
   pinMode(TR_TRIG, OUTPUT); pinMode(TR_ECHO, INPUT);
   pinMode(TS_TRIG, OUTPUT); pinMode(TS_ECHO, INPUT);
 
-  myservo.attach(23);
+  // -------- Correct ESP32 Servo Setup --------
+  ESP32PWM::allocateTimer(0);
+  ESP32PWM::allocateTimer(1);
+  ESP32PWM::allocateTimer(2);
+  ESP32PWM::allocateTimer(3);
+
+  myservo.setPeriodHertz(50);       
+  myservo.attach(23, 500, 2500);
   myservo.write(90);
 
+  // -------- WIFI --------
   WiFi.begin(SSID, PASS);
   while (WiFi.status() != WL_CONNECTED) delay(200);
 
