@@ -1,306 +1,233 @@
-/* esp32_controller.ino
-   ESP32 UDP-based controller for water-surface robotic collector
-   - Motor control (L298/TB6612 style)
-   - 3x long-range ultrasonic for obstacle avoidance (200 cm threshold)
-   - 1x short-range ultrasonic (10 cm) triggers servo (90->180->90)
-   - Listens for UDP JSON commands from laptop
-*/
-
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <ArduinoJson.h>
 #include <Servo.h>
 
-// ---------- WiFi ----------
-const char* SSID = "YOUR_WIFI_SSID";
-const char* PASS = "YOUR_WIFI_PASSWORD";
-const int UDP_PORT = 8888;
+const char* SSID = "YOUR_SSID";
+const char* PASS = "YOUR_PASSWORD";
+
 WiFiUDP udp;
-IPAddress laptopIP; // optional caching
+const int UDP_PORT = 8888;
 
-// ---------- Pins (match wiring above) ----------
-const int MOTOR_A_IN1 = 16;
-const int MOTOR_A_IN2 = 17;
-const int MOTOR_B_IN1 = 18;
-const int MOTOR_B_IN2 = 19;
-const int MOTOR_ENA_CHANNEL = 0;   // LEDC channel
-const int MOTOR_ENB_CHANNEL = 1;
+unsigned long nowMs = 0;
 
-const int MOTOR_PWM_PIN_A = 21;
-const int MOTOR_PWM_PIN_B = 22;
+// ---------------- MOTOR PINS ---------------------
+#define IN1 16
+#define IN2 17
+#define IN3 18
+#define IN4 19
+#define PWM_A 21
+#define PWM_B 22
 
-const int TRIG_FRONT = 32;
-const int ECHO_FRONT = 33;
-const int TRIG_LEFT  = 25;
-const int ECHO_LEFT  = 26;
-const int TRIG_RIGHT = 27;
-const int ECHO_RIGHT = 14;
-const int TRIG_SHORT = 12;
-const int ECHO_SHORT = 13;
+int SPEED_FORWARD = 180;
+int SPEED_TURN = 150;
 
-const int SERVO_PIN = 23;
-Servo pickupServo;
+// ---------------- ULTRASONICS --------------------
+#define TF_TRIG 32
+#define TF_ECHO 33
 
-// thresholds (cm)
-const float LONG_THRESHOLD = 200.0;
-const float SHORT_TRIGGER = 10.0;
+#define TL_TRIG 25
+#define TL_ECHO 26
 
-// motor speeds
-const int PWM_FREQ = 20000;
-const int PWM_RES = 8; // 8-bit
-const int DEFAULT_SPEED = 190; // 0-255 (approx)
-const int TURN_SPEED = 160;
+#define TR_TRIG 27
+#define TR_ECHO 14
 
-// runtime state
-unsigned long lastObstacleAvoidMillis = 0;
-const unsigned long OBSTACLE_CHECK_INTERVAL = 120; // ms
+#define TS_TRIG 12
+#define TS_ECHO 13
 
-// ---------- Utility: ultrasonic distance ----------
-long readUltrasonicCM(int trigPin, int echoPin) {
-  digitalWrite(trigPin, LOW);
-  delayMicroseconds(2);
-  digitalWrite(trigPin, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(trigPin, LOW);
-  long duration = pulseIn(echoPin, HIGH, 30000); // timeout 30ms
-  if (duration == 0) return 9999; // no echo (very far)
-  long cm = duration / 29 / 2;
-  return cm;
-}
+float long_limit = 200;
+float short_limit = 10;
 
-// ---------- Motor control ----------
-void setupMotorPins() {
-  pinMode(MOTOR_A_IN1, OUTPUT);
-  pinMode(MOTOR_A_IN2, OUTPUT);
-  pinMode(MOTOR_B_IN1, OUTPUT);
-  pinMode(MOTOR_B_IN2, OUTPUT);
+// ---------------- SERVO --------------------------
+Servo servo;
+int servoPos = 90;
+bool servoActive = false;
+unsigned long servoStart = 0;
 
-  // configure PWM channels
-  ledcSetup(MOTOR_ENA_CHANNEL, PWM_FREQ, 8);
-  ledcAttachPin(MOTOR_PWM_PIN_A, MOTOR_ENA_CHANNEL);
+// ---------------- TIMERS -------------------------
+unsigned long lastObstacleCheck = 0;
+unsigned long lastMotorAction = 0;
+unsigned long motorActionTime = 0;
 
-  ledcSetup(MOTOR_ENB_CHANNEL, PWM_FREQ, 8);
-  ledcAttachPin(MOTOR_PWM_PIN_B, MOTOR_ENB_CHANNEL);
+// --------------- STATES --------------------------
+String motorState = "stop";
+String navDirection = "center";
+
+long readCM(int trig, int echo) {
+  digitalWrite(trig, LOW); delayMicroseconds(2);
+  digitalWrite(trig, HIGH); delayMicroseconds(10);
+  digitalWrite(trig, LOW);
+
+  long dur = pulseIn(echo, HIGH, 25000);
+  if (dur <= 0) return 999;
+  return dur / 29 / 2;
 }
 
 void motorStop() {
-  digitalWrite(MOTOR_A_IN1, LOW);
-  digitalWrite(MOTOR_A_IN2, LOW);
-  digitalWrite(MOTOR_B_IN1, LOW);
-  digitalWrite(MOTOR_B_IN2, LOW);
-  ledcWrite(MOTOR_ENA_CHANNEL, 0);
-  ledcWrite(MOTOR_ENB_CHANNEL, 0);
+  digitalWrite(IN1, LOW); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, LOW);
+  ledcWrite(0, 0);
+  ledcWrite(1, 0);
 }
 
-void motorForward(int speed = DEFAULT_SPEED) {
-  digitalWrite(MOTOR_A_IN1, HIGH);
-  digitalWrite(MOTOR_A_IN2, LOW);
-  digitalWrite(MOTOR_B_IN1, HIGH);
-  digitalWrite(MOTOR_B_IN2, LOW);
-  ledcWrite(MOTOR_ENA_CHANNEL, speed);
-  ledcWrite(MOTOR_ENB_CHANNEL, speed);
+void motorForward() {
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+  ledcWrite(0, SPEED_FORWARD);
+  ledcWrite(1, SPEED_FORWARD);
 }
 
-void motorBackward(int speed = DEFAULT_SPEED) {
-  digitalWrite(MOTOR_A_IN1, LOW);
-  digitalWrite(MOTOR_A_IN2, HIGH);
-  digitalWrite(MOTOR_B_IN1, LOW);
-  digitalWrite(MOTOR_B_IN2, HIGH);
-  ledcWrite(MOTOR_ENA_CHANNEL, speed);
-  ledcWrite(MOTOR_ENB_CHANNEL, speed);
+void turnLeft() {
+  digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+  ledcWrite(0, SPEED_TURN);
+  ledcWrite(1, SPEED_TURN);
 }
 
-void motorTurnLeft(int speed = TURN_SPEED) {
-  digitalWrite(MOTOR_A_IN1, LOW);
-  digitalWrite(MOTOR_A_IN2, HIGH);
-  digitalWrite(MOTOR_B_IN1, HIGH);
-  digitalWrite(MOTOR_B_IN2, LOW);
-  ledcWrite(MOTOR_ENA_CHANNEL, speed);
-  ledcWrite(MOTOR_ENB_CHANNEL, speed);
+void turnRight() {
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH);
+  ledcWrite(0, SPEED_TURN);
+  ledcWrite(1, SPEED_TURN);
 }
 
-void motorTurnRight(int speed = TURN_SPEED) {
-  digitalWrite(MOTOR_A_IN1, HIGH);
-  digitalWrite(MOTOR_A_IN2, LOW);
-  digitalWrite(MOTOR_B_IN1, LOW);
-  digitalWrite(MOTOR_B_IN2, HIGH);
-  ledcWrite(MOTOR_ENA_CHANNEL, speed);
-  ledcWrite(MOTOR_ENB_CHANNEL, speed);
-}
+void smoothServoUpdate() {
+  if (!servoActive) return;
 
-// ---------- Obstacle avoidance ----------
-bool checkAndAvoidObstacles() {
-  // read sensors
-  long dFront = readUltrasonicCM(TRIG_FRONT, ECHO_FRONT);
-  long dLeft  = readUltrasonicCM(TRIG_LEFT, ECHO_LEFT);
-  long dRight = readUltrasonicCM(TRIG_RIGHT, ECHO_RIGHT);
-  // If any less than LONG_THRESHOLD, take action
-  if (dFront < LONG_THRESHOLD || dLeft < LONG_THRESHOLD || dRight < LONG_THRESHOLD) {
-    // Simple strategy:
-    // If front obstacle detected: back up and turn away from the closest side
-    if (dFront < LONG_THRESHOLD) {
-      motorBackward(DEFAULT_SPEED);
-      delay(400);
-      if (dLeft > dRight) {
-        motorTurnLeft();
-      } else {
-        motorTurnRight();
-      }
-      delay(400);
-      motorStop();
-      return true;
-    } else if (dLeft < LONG_THRESHOLD) {
-      // turn right a bit
-      motorTurnRight();
-      delay(300);
-      motorStop();
-      return true;
-    } else if (dRight < LONG_THRESHOLD) {
-      motorTurnLeft();
-      delay(300);
-      motorStop();
-      return true;
-    }
-  }
-  return false;
-}
-
-// ---------- Pickup servo routine ----------
-void pickupSequence() {
-  // short-range sensor must confirm target at under 10cm first
-  long d = readUltrasonicCM(TRIG_SHORT, ECHO_SHORT);
-  if (d <= SHORT_TRIGGER) {
-    Serial.println("SHORT RANGE object confirmed, actuating servo");
-    // rotate from 90 to 180, wait, then back to 90
-    pickupServo.write(180);
-    delay(900);
-    // (optional: actuate gripper here)
-    pickupServo.write(90);
-    delay(400);
+  if (millis() - servoStart < 600) {
+    servo.write(180);
+  } else if (millis() - servoStart < 1100) {
+    // hold
+  } else if (millis() - servoStart < 1700) {
+    servo.write(90);
   } else {
-    Serial.println("SHORT RANGE not close enough (d=" + String(d) + "cm)");
+    servoActive = false;
+    servo.write(90);
   }
 }
 
-// ---------- UDP command processing ----------
-void processUdpCommand(char* buf, int len, IPAddress remoteIP, uint16_t remotePort) {
-  // sample input: {"cmd":"navigate","pos":"left","label":"plastic"}
-  StaticJsonDocument<256> doc;
-  DeserializationError err = deserializeJson(doc, buf, len);
-  if (err) {
-    Serial.println("JSON parse failed");
+void attemptPickup() {
+  long d = readCM(TS_TRIG, TS_ECHO);
+  if (d < short_limit) {
+    servoActive = true;
+    servoStart = millis();
+  }
+}
+
+void obstacleAvoidance() {
+  long dF = readCM(TF_TRIG, TF_ECHO);
+  long dL = readCM(TL_TRIG, TL_ECHO);
+  long dR = readCM(TR_TRIG, TR_ECHO);
+
+  if (dF < long_limit) {
+    motorStop();
+    motorActionTime = 400;
+    motorState = "back";
+    lastMotorAction = millis();
     return;
   }
-  const char* cmd = doc["cmd"] | "";
-  if (strcmp(cmd, "navigate") == 0) {
-    const char* pos = doc["pos"] | "center";
-    Serial.println("Navigate command: " + String(pos));
-    // Simple navigation: lateral adjustments then forward
-    if (strcmp(pos, "left") == 0) {
-      // turn left a bit, then forward
-      motorTurnLeft();
-      delay(350);
-      motorForward();
-      delay(700);
-      motorStop();
-    } else if (strcmp(pos, "right") == 0) {
-      motorTurnRight();
-      delay(350);
-      motorForward();
-      delay(700);
-      motorStop();
-    } else {
-      // center -> go forward brief
-      motorForward();
-      delay(900);
-      motorStop();
-    }
-  } else if (strcmp(cmd, "stop_and_pick") == 0) {
-    Serial.println("Stop and pick");
+  if (dL < long_limit) {
     motorStop();
-    delay(200);
-    // confirm short-range then actuate servo
-    pickupSequence();
-  } else if (strcmp(cmd, "stop") == 0) {
-    motorStop();
-  } else {
-    Serial.println("Unknown cmd:");
-    Serial.println(cmd);
+    motorActionTime = 300;
+    motorState = "right";
+    lastMotorAction = millis();
+    return;
   }
-
-  // Optionally send ack back
-  StaticJsonDocument<128> ack;
-  ack["ack"] = "ok";
-  ack["cmd"] = cmd;
-  char out[128];
-  size_t n = serializeJson(ack, out);
-  udp.beginPacket(remoteIP, remotePort);
-  udp.write((uint8_t*)out, n);
-  udp.endPacket();
+  if (dR < long_limit) {
+    motorStop();
+    motorActionTime = 300;
+    motorState = "left";
+    lastMotorAction = millis();
+    return;
+  }
 }
 
-// ---------- Setup & loop ----------
+void updateMotor() {
+  if (millis() - lastMotorAction < motorActionTime) {
+    if (motorState == "forward") motorForward();
+    else if (motorState == "left") turnLeft();
+    else if (motorState == "right") turnRight();
+    else if (motorState == "back") ; // already stopped
+    return;
+  }
+
+  if (motorState != "stop") {
+    motorStop();
+    motorState = "stop";
+  }
+}
+
+void processCommand(String jsonStr) {
+  StaticJsonDocument<200> doc;
+  deserializeJson(doc, jsonStr);
+
+  String cmd = doc["cmd"];
+
+  if (cmd == "navigate") {
+    navDirection = doc["pos"].as<String>();
+    if (navDirection == "left") motorState = "left";
+    else if (navDirection == "right") motorState = "right";
+    else motorState = "forward";
+
+    motorActionTime = 500;
+    lastMotorAction = millis();
+  }
+
+  else if (cmd == "stop_and_pick") {
+    motorState = "stop";
+    motorStop();
+    attemptPickup();
+  }
+
+  else if (cmd == "scan") {
+    motorState = "forward";
+    motorActionTime = 400;
+    lastMotorAction = millis();
+  }
+}
+
 void setup() {
   Serial.begin(115200);
-  delay(500);
 
-  // pins
-  setupMotorPins();
-  pinMode(TRIG_FRONT, OUTPUT); pinMode(ECHO_FRONT, INPUT);
-  pinMode(TRIG_LEFT, OUTPUT);  pinMode(ECHO_LEFT, INPUT);
-  pinMode(TRIG_RIGHT, OUTPUT); pinMode(ECHO_RIGHT, INPUT);
-  pinMode(TRIG_SHORT, OUTPUT); pinMode(ECHO_SHORT, INPUT);
+  pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
 
-  pickupServo.attach(SERVO_PIN);
-  pickupServo.write(90); // initial position
+  ledcSetup(0, 20000, 8);
+  ledcAttachPin(PWM_A, 0);
+  ledcSetup(1, 20000, 8);
+  ledcAttachPin(PWM_B, 1);
 
-  // WiFi
-  WiFi.mode(WIFI_STA);
+  pinMode(TF_TRIG, OUTPUT); pinMode(TF_ECHO, INPUT);
+  pinMode(TL_TRIG, OUTPUT); pinMode(TL_ECHO, INPUT);
+  pinMode(TR_TRIG, OUTPUT); pinMode(TR_ECHO, INPUT);
+  pinMode(TS_TRIG, OUTPUT); pinMode(TS_ECHO, INPUT);
+
+  servo.attach(23);
+  servo.write(90);
+
   WiFi.begin(SSID, PASS);
-  Serial.print("Connecting to WiFi");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(400);
-    Serial.print(".");
-  }
-  Serial.println();
-  Serial.print("Connected. IP: ");
-  Serial.println(WiFi.localIP());
+  while (WiFi.status() != WL_CONNECTED) delay(200);
 
   udp.begin(UDP_PORT);
-  Serial.print("UDP listening on port ");
-  Serial.println(UDP_PORT);
 }
 
 void loop() {
-  // 1) check for incoming UDP
-  int packetSize = udp.parsePacket();
-  if (packetSize) {
-    char incoming[512];
-    int len = udp.read(incoming, 512);
-    incoming[len] = 0;
-    IPAddress remoteIP = udp.remoteIP();
-    uint16_t remotePort = udp.remotePort();
-    Serial.print("Received packet from ");
-    Serial.println(remoteIP);
-    processUdpCommand(incoming, len, remoteIP, remotePort);
+  nowMs = millis();
+
+  int pkt = udp.parsePacket();
+  if (pkt) {
+    char data[256];
+    int len = udp.read(data, 256);
+    data[len] = 0;
+    processCommand(String(data));
   }
 
-  // 2) Periodic obstacle checking
-  unsigned long now = millis();
-  if (now - lastObstacleAvoidMillis > OBSTACLE_CHECK_INTERVAL) {
-    bool avoided = checkAndAvoidObstacles();
-    lastObstacleAvoidMillis = now;
-    (void)avoided;
+  if (nowMs - lastObstacleCheck > 70) {
+    obstacleAvoidance();
+    lastObstacleCheck = nowMs;
   }
 
-  // 3) Autonomous short-range detection: if an object is detected within short threshold while searching,
-  // optionally do an auto pick (this is optional - we assume selection comes from laptop)
-  // long dshort = readUltrasonicCM(TRIG_SHORT, ECHO_SHORT);
-  // if (dshort <= SHORT_TRIGGER) {
-  //   Serial.println("Auto short-range trigger");
-  //   motorStop();
-  //   pickupSequence();
-  // }
+  smoothServoUpdate();
 
-  delay(20);
+  updateMotor();
 }
