@@ -1,0 +1,116 @@
+#!/usr/bin/env python3
+# Ultra-stable, low-latency trash detector for laptop
+
+import cv2
+import numpy as np
+import socket
+import json
+import time
+
+ESP_IP = "192.168.1.50"       # CHANGE THIS
+ESP_PORT = 8888
+VIDEO_URL = "http://192.168.1.11:8080/video"  # CHANGE THIS
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.settimeout(0.1)
+
+cap = cv2.VideoCapture(VIDEO_URL)
+if not cap.isOpened():
+    print("Camera connection failed.")
+    exit()
+
+FRAME_SKIP = 3          # process every 3rd frame to avoid lag
+command_interval = 0.4   # send command every 400ms
+last_cmd_time = 0
+
+def send_cmd(cmd):
+    global last_cmd_time
+    now = time.time()
+    if now - last_cmd_time < command_interval:
+        return
+    last_cmd_time = now
+    msg = json.dumps(cmd).encode()
+    try:
+        sock.sendto(msg, (ESP_IP, ESP_PORT))
+    except:
+        pass
+
+def heuristic_detect(frame):
+    """Fast plastic & can detector (no ML, low CPU)."""
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+    edges = cv2.Canny(gray, 40, 120)
+    edges = cv2.dilate(edges, None, iterations=1)
+
+    cnts, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    objects = []
+
+    for c in cnts:
+        area = cv2.contourArea(c)
+        if area < 1200:
+            continue
+
+        x, y, w, h = cv2.boundingRect(c)
+        roi = frame[y:y+h, x:x+w]
+        roi_gray = gray[y:y+h, x:x+w]
+
+        mean_val = np.mean(roi_gray)
+        bright = mean_val > 160
+
+        if bright:
+            label = "aluminum_can"
+        else:
+            label = "plastic"
+
+        objects.append((label, x, y, w, h, area))
+
+    return objects
+
+FRAME_ID = 0
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        print("Camera feed lost, retrying...")
+        time.sleep(0.5)
+        cap = cv2.VideoCapture(VIDEO_URL)
+        continue
+
+    FRAME_ID += 1
+    if FRAME_ID % FRAME_SKIP != 0:
+        continue
+
+    detections = heuristic_detect(frame)
+    if len(detections) > 0:
+        # pick nearest (largest area)
+        det = max(detections, key=lambda x: x[5])
+        label, x, y, w, h, area = det
+        cx = x + w//2
+
+        # movement zones
+        zone_L = frame.shape[1] * 0.33
+        zone_R = frame.shape[1] * 0.66
+
+        if cx < zone_L:
+            pos = "left"
+        elif cx > zone_R:
+            pos = "right"
+        else:
+            pos = "center"
+
+        if area < 16000:
+            send_cmd({"cmd": "navigate", "pos": pos, "label": label})
+        else:
+            send_cmd({"cmd": "stop_and_pick", "label": label})
+    else:
+        # idle forward scan
+        send_cmd({"cmd": "scan"})
+
+    cv2.imshow("Detector", frame)
+    if cv2.waitKey(1) == ord('q'):
+        break
+
+cap.release()
+sock.close()
+cv2.destroyAllWindows()
